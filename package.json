@@ -1,0 +1,42 @@
+{
+  "name": "screen-vision-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for screen capture, OCR, and visual understanding on macOS",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "test": "node test-server.js"
+  },
+  "keywords": [
+    "mcp",
+    "screen-capture",
+    "ocr",
+    "vision",
+    "macos",
+    "model-context-protocol",
+    "claude",
+    "automation",
+    "screenshots"
+  ],
+  "author": "TIMBOTGPT",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TIMBOTGPT/screen-vision-mcp.git"
+  },
+  "homepage": "https://github.com/TIMBOTGPT/screen-vision-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/TIMBOTGPT/screen-vision-mcp/issues"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^0.4.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "os": [
+    "darwin"
+  ]
+}

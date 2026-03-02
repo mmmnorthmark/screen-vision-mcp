@@ -171,7 +171,7 @@ Grant these permissions in System Preferences > Security & Privacy.
 
 Screenshots are automatically saved to a `screenshots/` directory within the server folder. You can:
 - Access screenshots via the resource URI system
-- Specify custom save paths for individual captures
+- Optionally set `save_path` to a **filename or path relative to `screenshots/`** (paths outside this directory are rejected)
 - View saved screenshots through Claude's resource system
 
 ## Development
@@ -197,9 +197,13 @@ The clicking and monitoring features enable automation workflows when combined w
 
 ## Security
 
-- All screen captures require explicit permission
-- File system access is controlled by macOS permissions
-- No network access required for core functionality
+- **Path containment**: Custom `save_path` is restricted to the server’s `screenshots/` directory; path traversal (e.g. `../`) is rejected.
+- **Input validation**: Tool arguments (coordinates, dimensions, `app_name`) are validated and sanitized to prevent command injection.
+- **Resource reads**: Screenshot resources are served only by basename; URI path traversal cannot read files outside `screenshots/`.
+- **Error responses**: Client-facing errors are generic; detailed messages are logged server-side only.
+- All screen captures require explicit macOS permission (Screen Recording, Accessibility).
+- No network access required for core functionality.
+- **Dependency**: `@modelcontextprotocol/sdk` may have advisories (e.g. ReDoS in UriTemplate). This server uses simple `screenshot://` resource URIs only. For a fully patched stack, consider upgrading to `@modelcontextprotocol/sdk@^1.25.2` when migrating to the 1.x API.
 
 ## License
 

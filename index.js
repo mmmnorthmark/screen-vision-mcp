@@ -8,19 +8,62 @@ import {
   ListToolsRequestSchema,
   ReadResourceRequestSchema
 } from '@modelcontextprotocol/sdk/types.js';
-import { exec } from 'child_process';
+import { exec, execFile } from 'child_process';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { promisify } from 'util';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Create screenshots directory
-const SCREENSHOTS_DIR = path.join(__dirname, 'screenshots');
+const SCREENSHOTS_DIR = path.resolve(path.join(__dirname, 'screenshots'));
 await fs.mkdir(SCREENSHOTS_DIR, { recursive: true });
+
+// --- Security: path containment and input validation (exfil / sandbox) ---
+
+/**
+ * Resolve a path and ensure it is strictly under SCREENSHOTS_DIR. Rejects path traversal.
+ * @param {string} relativeOrFilename - Filename or relative path (no leading slashes for absolute intent).
+ * @returns {string} Resolved path under SCREENSHOTS_DIR.
+ * @throws {Error} If path escapes SCREENSHOTS_DIR.
+ */
+function resolvePathWithinScreenshots(relativeOrFilename) {
+  const normalized = path.normalize(relativeOrFilename).replace(/^(\.\.(\/|\\|$))+/, '');
+  const resolved = path.resolve(SCREENSHOTS_DIR, normalized);
+  const base = path.resolve(SCREENSHOTS_DIR);
+  if (resolved !== base && !resolved.startsWith(base + path.sep)) {
+    throw new Error('Invalid path: must be under screenshots directory');
+  }
+  return resolved;
+}
+
+/**
+ * Validate numeric screen parameter (coordinate or dimension).
+ */
+function validateScreenNumber(value, name, max = 10000) {
+  const n = Number(value);
+  if (typeof value === 'undefined' || value === null || Number.isNaN(n) || n < 0 || n > max) {
+    throw new Error(`Invalid ${name}: must be a number between 0 and ${max}`);
+  }
+  return n;
+}
+
+/** Allowlist for app_name: alphanumeric, spaces, hyphen, underscore only (no shell metacharacters). */
+const APP_NAME_ALLOW = /^[a-zA-Z0-9 _-]+$/;
+
+function validateAppName(appName) {
+  if (typeof appName !== 'string' || !appName.trim()) {
+    throw new Error('Invalid app_name: required non-empty string');
+  }
+  if (!APP_NAME_ALLOW.test(appName)) {
+    throw new Error('Invalid app_name: only letters, numbers, spaces, hyphen, underscore allowed');
+  }
+  return appName.trim();
+}
 
 class ScreenVisionServer {
   constructor() {
@@ -223,11 +266,12 @@ class ScreenVisionServer {
             throw new Error(`Unknown tool: ${name}`);
         }
       } catch (error) {
+        console.error('Tool error:', name, error);
         return {
           content: [
             {
               type: 'text',
-              text: `Error: ${error.message}`
+              text: 'Tool execution failed'
             }
           ]
         };
@@ -249,14 +293,18 @@ class ScreenVisionServer {
       };
     });
 
-    // Read screenshot resources
+    // Read screenshot resources (path traversal safe: only files under SCREENSHOTS_DIR by basename)
     this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
       const { uri } = request.params;
-      
+
       if (uri.startsWith('screenshot://')) {
-        const filename = uri.replace('screenshot://', '');
-        const filepath = path.join(SCREENSHOTS_DIR, filename);
-        
+        const raw = uri.replace('screenshot://', '');
+        const filename = path.basename(raw);
+        if (!filename || filename !== raw || /[\\/]/.test(raw)) {
+          throw new Error('Invalid resource URI');
+        }
+        const filepath = resolvePathWithinScreenshots(filename);
+
         try {
           const data = await fs.readFile(filepath, 'base64');
           return {
@@ -269,21 +317,24 @@ class ScreenVisionServer {
             ]
           };
         } catch (error) {
-          throw new Error(`Failed to read screenshot: ${error.message}`);
+          console.error('ReadResource failed:', error);
+          throw new Error('Failed to read screenshot');
         }
       }
-      
-      throw new Error(`Unknown resource URI: ${uri}`);
+
+      throw new Error('Unknown resource URI');
     });
   }
 
   async captureFullscreen(args) {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const filename = `fullscreen-${timestamp}.png`;
-    const filepath = args.save_path || path.join(SCREENSHOTS_DIR, filename);
-    
-    const { stdout } = await execAsync(`screencapture -x "${filepath}"`);
-    
+    const filepath = args.save_path
+      ? resolvePathWithinScreenshots(args.save_path)
+      : path.join(SCREENSHOTS_DIR, filename);
+
+    await execFileAsync('screencapture', ['-x', filepath]);
+
     return {
       content: [
         {
@@ -295,28 +346,31 @@ class ScreenVisionServer {
   }
 
   async captureWindow(args) {
-    const { app_name, save_path } = args;
+    const appName = validateAppName(args.app_name);
+    const save_path = args.save_path;
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const filename = `window-${app_name}-${timestamp}.png`;
-    const filepath = save_path || path.join(SCREENSHOTS_DIR, filename);
-    
-    // First, get window ID for the app
+    const filename = `window-${appName}-${timestamp}.png`;
+    const filepath = save_path
+      ? resolvePathWithinScreenshots(save_path)
+      : path.join(SCREENSHOTS_DIR, filename);
+
     const script = `
       tell application "System Events"
         set frontApp to name of first application process whose frontmost is true
-        if frontApp is "${app_name}" then
+        if frontApp is "${appName}" then
           return "current"
         else
-          tell application "${app_name}" to activate
+          tell application "${appName}" to activate
           delay 0.5
           return "activated"
         end if
       end tell
     `;
-    
     await execAsync(`osascript -e '${script.replace(/'/g, "\\'")}'`);
-    await execAsync(`screencapture -x -o -l$(osascript -e 'tell app "${app_name}" to id of window 1') "${filepath}"`);
-    
+
+    const { stdout: windowId } = await execAsync(`osascript -e 'tell application "${appName}" to id of window 1'`);
+    await execFileAsync('screencapture', ['-x', '-o', '-l' + String(windowId).trim(), filepath]);
+
     return {
       content: [
         {
@@ -328,13 +382,18 @@ class ScreenVisionServer {
   }
 
   async captureRegion(args) {
-    const { x, y, width, height, save_path } = args;
+    const x = validateScreenNumber(args.x, 'x');
+    const y = validateScreenNumber(args.y, 'y');
+    const width = validateScreenNumber(args.width, 'width');
+    const height = validateScreenNumber(args.height, 'height');
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const filename = `region-${timestamp}.png`;
-    const filepath = save_path || path.join(SCREENSHOTS_DIR, filename);
-    
-    await execAsync(`screencapture -x -R${x},${y},${width},${height} "${filepath}"`);
-    
+    const filepath = args.save_path
+      ? resolvePathWithinScreenshots(args.save_path)
+      : path.join(SCREENSHOTS_DIR, filename);
+
+    await execFileAsync('screencapture', ['-x', '-R' + [x, y, width, height].join(','), filepath]);
+
     return {
       content: [
         {
@@ -346,18 +405,21 @@ class ScreenVisionServer {
   }
 
   async extractTextFromScreen(args) {
-    // First capture the screen or region
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const filename = `ocr-${timestamp}.png`;
     const filepath = path.join(SCREENSHOTS_DIR, filename);
-    
+
     if (args.region) {
       const { x, y, width, height } = args.region;
-      await execAsync(`screencapture -x -R${x},${y},${width},${height} "${filepath}"`);
+      const rx = validateScreenNumber(x, 'region.x');
+      const ry = validateScreenNumber(y, 'region.y');
+      const rw = validateScreenNumber(width, 'region.width');
+      const rh = validateScreenNumber(height, 'region.height');
+      await execFileAsync('screencapture', ['-x', '-R' + [rx, ry, rw, rh].join(','), filepath]);
     } else {
-      await execAsync(`screencapture -x "${filepath}"`);
+      await execFileAsync('screencapture', ['-x', filepath]);
     }
-    
+
     return {
       content: [
         {
@@ -369,13 +431,10 @@ class ScreenVisionServer {
   }
 
   async findTextOnScreen(args) {
-    const { text, case_sensitive = false } = args;
-    
-    // Capture full screen for analysis
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const filepath = path.join(SCREENSHOTS_DIR, `find-text-${timestamp}.png`);
-    await execAsync(`screencapture -x "${filepath}"`);
-    
+    await execFileAsync('screencapture', ['-x', filepath]);
+
     return {
       content: [
         {
@@ -416,11 +475,12 @@ class ScreenVisionServer {
         ]
       };
     } catch (error) {
+      console.error('getWindowList failed:', error);
       return {
         content: [
           {
             type: 'text',
-            text: `Error getting window list: ${error.message}`
+            text: 'Error getting window list'
           }
         ]
       };
@@ -441,11 +501,12 @@ class ScreenVisionServer {
         ]
       };
     } catch (error) {
+      console.error('getScreenInfo failed:', error);
       return {
         content: [
           {
             type: 'text',
-            text: `Error getting screen info: ${error.message}`
+            text: 'Error getting screen info'
           }
         ]
       };
@@ -453,18 +514,21 @@ class ScreenVisionServer {
   }
 
   async clickAtPosition(args) {
-    const { x, y, button = 'left', double_click = false } = args;
-    
+    const x = validateScreenNumber(args.x, 'x');
+    const y = validateScreenNumber(args.y, 'y');
+    const button = args.button === 'right' || args.button === 'middle' ? args.button : 'left';
+    const double_click = Boolean(args.double_click);
+
     const script = `
       tell application "System Events"
         click at {${x}, ${y}}
         ${double_click ? `delay 0.1\nclick at {${x}, ${y}}` : ''}
       end tell
     `;
-    
+
     try {
       await execAsync(`osascript -e '${script.replace(/'/g, "\\'")}'`);
-      
+
       return {
         content: [
           {
@@ -474,11 +538,12 @@ class ScreenVisionServer {
         ]
       };
     } catch (error) {
+      console.error('clickAtPosition failed:', error);
       return {
         content: [
           {
             type: 'text',
-            text: `Error clicking: ${error.message}`
+            text: 'Error clicking at position'
           }
         ]
       };
@@ -486,13 +551,22 @@ class ScreenVisionServer {
   }
 
   async monitorScreenRegion(args) {
-    const { x, y, width, height, duration_seconds = 5, interval_ms = 1000 } = args;
+    const x = validateScreenNumber(args.x, 'x');
+    const y = validateScreenNumber(args.y, 'y');
+    const width = validateScreenNumber(args.width, 'width');
+    const height = validateScreenNumber(args.height, 'height');
+    const duration_seconds = typeof args.duration_seconds === 'number' && args.duration_seconds > 0
+      ? Math.min(args.duration_seconds, 30)
+      : 5;
+    const interval_ms = typeof args.interval_ms === 'number' && args.interval_ms >= 100
+      ? Math.min(args.interval_ms, 5000)
+      : 1000;
     const maxDuration = Math.min(duration_seconds, 30);
     const changes = [];
-    
+
     const captureAndCompare = async (index) => {
       const filepath = path.join(SCREENSHOTS_DIR, `monitor-${index}.png`);
-      await execAsync(`screencapture -x -R${x},${y},${width},${height} "${filepath}"`);
+      await execFileAsync('screencapture', ['-x', '-R' + [x, y, width, height].join(','), filepath]);
       return filepath;
     };
     

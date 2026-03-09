@@ -31,7 +31,7 @@
     "url": "https://github.com/TIMBOTGPT/screen-vision-mcp/issues"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^0.4.0"
+    "@modelcontextprotocol/sdk": "^1.27.1"
   },
   "engines": {
     "node": ">=16.0.0"
